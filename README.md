@@ -28,14 +28,15 @@ watchdog, from `/data/adb/crdroid-garnet-ram-fix/`:
 | Thrashing tolerance | `lmkd_native/thrashing_limit` | 100 → 400 |
 | PSI tolerance | `lmkd_native/psi_partial_stall_ms` | → 150 |
 | PSI tolerance | `lmkd_native/psi_complete_stall_ms` | → 900 (≤ PSI window) |
-| Stop compaction churn | `activity_manager/compact_full_oom_adj` | 900 → 999 |
-| Throttle compaction | `activity_manager/compact_throttle_full_full` | → 20000 |
+| Stop compaction churn | `activity_manager/use_compaction` | true → false |
 | Cheap zram refaults | `vm.page-cluster` | 3 → 0 |
 | Less aggressive swap | `vm.swappiness` | 100 → 60 |
 
 Also runs `device_config set_sync_disabled_for_tests persistent` so GMS config sync
-cannot overwrite the values, and `setprop lmkd.reinit 1` so lmkd re-reads its
-configuration.
+cannot overwrite the values, `setprop lmkd.reinit 1` so lmkd re-reads its
+configuration, and deletes the dead keys written by v1.0.x/v1.1.x
+(`compact_full_oom_adj`, `compact_throttle_full_full`, `use_full_compaction`,
+`use_recompression` - see "Safety notes").
 
 The watchdog re-applies any setting that gets reset (default: every 60 s,
 reads only while values are stable). This covers the unresolved "who resets
@@ -54,23 +55,26 @@ reads only while values are stable). This covers the unresolved "who resets
 
 | Key | Default | Meaning |
 |---|---|---|
-| `CFG_DISABLE_FULL_COMPACTION` | `1` | Stop FULL (`MADV_PAGEOUT`) compaction of cached apps |
-| `CFG_DISABLE_COMPACTION` | `0` | Hard mode: `use_compaction false` (no compaction at all) |
+| `CFG_DISABLE_COMPACTION` | `1` | `use_compaction false` — stop CachedAppOptimizer app compaction (kills the refault loop at the source) |
 | `CFG_FIX_LMKD` | `1` | `ro.lmk.medium` + `lmkd_native` tolerances |
 | `CFG_FIX_VM` | `1` | `vm.page-cluster=0`, `vm.swappiness=60` |
 | `CFG_WATCHDOG` | `1` | Keep re-applying settings if something resets them |
 | `CFG_WATCHDOG_INTERVAL` | `60` | Watchdog period (seconds) |
 
-If the gentle compaction fix is not enough, set `CFG_DISABLE_COMPACTION=1`, reboot.
+v1.1.x configs are migrated automatically at install time (backup in
+`config.sh.v1.1.bak`): the old `CFG_DISABLE_FULL_COMPACTION` intent maps onto
+`CFG_DISABLE_COMPACTION` (see "Safety notes (v1.1.x dead keys)").
 
 ## Verify
 
-- Action button shows before/after values.
+- Action button shows before/after values and a live churn check (5 s `vmstat`
+  delta: `pswpout`/`pswpin`/`workingset_refault_anon`/`pgmajfault` rates plus a
+  verdict line).
 - Log: `/data/adb/crdroid-garnet-ram-fix/logs/garnetfix.log` (only logs actual changes).
-- With `diag/pull_diag.sh` from this workspace, re-run the collector and check:
-  - `pswpin ≈ 0` while idle, `workingset_refault_anon` no longer tracks `pswpin`
-  - `am_compact FULL` events stop targeting active apps
-  - no new `reason=3 (LOW_MEMORY)` entries in `dumpsys/exit_info.txt`
+- Expected result after a day of use:
+  - `pswpin ≈ 0` while idle; `am_compact` events stop entirely
+  - no new `reason=3 (LOW_MEMORY)` entries in `dumpsys activity exit-info`
+  - `use_compaction=false` under `Compaction settings` in `dumpsys activity -a`
   - `page-cluster=0`, `swappiness=60`, `ro.lmk.medium=800` in the sysctl/prop dumps
 
 ## Uninstall
@@ -111,6 +115,36 @@ To recover a device broken by v1.0.0: the bad value survives module removal
 `lmkd_native/*` DeviceConfig keys (`device_config delete`, or remove the
 `<setting>` entries from `settings_config.xml` while booted in recovery) before
 rebooting.
+
+## Safety notes (v1.1.x dead keys)
+
+v1.0.x/v1.1.x tried to "keep compaction but throttle it" with
+`activity_manager/compact_full_oom_adj`, `compact_throttle_full_full`,
+`use_full_compaction` and `use_recompression`. **Those keys do not exist in
+Android 16's `CachedAppOptimizer`** — verified against the device's own
+`/system/framework/services.jar` (zero occurrences). The class only reads
+`use_compaction`, `compact_throttle_1..6`, `compact_throttle_min_oom_adj`,
+`compact_throttle_max_oom_adj`, `compact_full_rss_throttle_kb`,
+`compact_full_delta_rss_throttle_kb` and `compact_proc_state_throttle`.
+`device_config put` accepts any key, so the writes "succeed" and simply sit in
+the settings provider while compaction churns on unchanged — measured on-device:
+v1.1.0 ran with its full config active and the refault loop continued at
+`pswpin == workingset_refault_anon` ≈ 134 pages/s while idle.
+
+There is no "disable FULL compaction only" switch to fall back to either:
+`resolveCompactionProfile()` maps `SOME → NONE` and `FULL → ANON`
+(`ENABLE_SHARED_AND_CODE_COMPACT=false`), so the only compaction that ever
+executes is anon pageout into zram — the exact churn this module exists to stop.
+Since v1.2.0 the module therefore uses the one verified master switch
+(`use_compaction=false`) and deletes the dead keys it (and any community fix)
+may have left behind.
+
+Since v1.2.0:
+
+- compaction fix = `activity_manager/use_compaction=false` (the only real
+  switch on Android 16), dead keys removed on every apply;
+- v1.1.x configs migrate automatically at install (`config.sh.v1.1.bak`);
+- `action.sh` includes a live churn check (the refault-loop metric).
 
 ## Layout
 

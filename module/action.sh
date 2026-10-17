@@ -21,6 +21,9 @@ echo
 echo "[*] Effective values (after):"
 print_status
 echo
+echo "[*] Swap churn check (refault loop metric):"
+print_churn
+echo
 if [ "$CFG_WATCHDOG" = "1" ]; then
     echo "[i] Watchdog: ON (every ${CFG_WATCHDOG_INTERVAL}s, keeps values in place)"
 else

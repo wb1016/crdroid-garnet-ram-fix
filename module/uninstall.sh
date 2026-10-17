@@ -9,7 +9,9 @@ DC=/system/bin/device_config
 
 if command -v "$DC" >/dev/null 2>&1 || [ -x "$DC" ]; then
     # only keys this module manages (the ROM's own
-    # persist.device_config.lmkd_native.thrashing_limit_critical is left alone)
+    # persist.device_config.lmkd_native.thrashing_limit_critical is left alone;
+    # use_full_compaction / use_recompression / compact_full_oom_adj /
+    # compact_throttle_full_full are legacy no-op keys from v1.0.x/v1.1.x)
     for key in compact_full_oom_adj compact_throttle_full_full use_compaction use_full_compaction use_recompression; do
         "$DC" delete activity_manager "$key" >/dev/null 2>&1
     done

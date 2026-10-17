@@ -45,13 +45,26 @@ trim_log() {
 
 load_config() {
     # defaults
-    CFG_DISABLE_FULL_COMPACTION=1
-    CFG_DISABLE_COMPACTION=0
+    CFG_DISABLE_COMPACTION=1
     CFG_FIX_LMKD=1
     CFG_FIX_VM=1
     CFG_WATCHDOG=1
     CFG_WATCHDOG_INTERVAL=60
+    CFG_DISABLE_FULL_COMPACTION=""    # legacy v1.0.x/v1.1.x knob (see below)
     [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+    # --- legacy config (v1.0.x / v1.1.x) compatibility ----------------------
+    # Those versions had CFG_DISABLE_FULL_COMPACTION ("gentle") and
+    # CFG_DISABLE_COMPACTION ("hard"). The gentle mode wrote
+    # activity_manager/compact_full_oom_adj + compact_throttle_full_full - keys
+    # that Android 16 never reads (verified against this device's services.jar),
+    # so it never stopped anything. v1.2+ maps the intent "stop the compaction
+    # churn" onto CFG_DISABLE_COMPACTION; an old config that explicitly opted
+    # out of both keeps compaction untouched.
+    if [ -n "$CFG_DISABLE_FULL_COMPACTION" ]; then
+        if [ "$CFG_DISABLE_FULL_COMPACTION" = "1" ] && [ "$CFG_DISABLE_COMPACTION" != "1" ]; then
+            CFG_DISABLE_COMPACTION=1
+        fi
+    fi
 }
 
 # -------------------------------------------------------------- helpers ------
@@ -140,6 +153,24 @@ dc_put_bounded() {
     dc_put "$_ns" "$_key" "$_want"
 }
 
+# dc_delete <namespace> <key> - remove a key (residue cleanup), only when set
+dc_delete() {
+    _ns="$1"
+    _key="$2"
+    command -v device_config >/dev/null 2>&1 || return 1
+    _cur=$(device_config get "$_ns" "$_key" 2>/dev/null)
+    if [ -z "$_cur" ] || [ "$_cur" = "null" ]; then
+        return 0
+    fi
+    if device_config delete "$_ns" "$_key" >/dev/null 2>&1; then
+        log INFO "device_config $_ns/$_key: removed (was '$_cur')"
+        CHANGED=$((CHANGED + 1))
+    else
+        log WARN "device_config delete $_ns $_key failed"
+        return 1
+    fi
+}
+
 # ------------------------------------------------------------ the fixes -----
 
 # Stop DeviceConfig from syncing our values away (GMS) - once per install
@@ -154,21 +185,29 @@ ensure_sync_disabled() {
     fi
 }
 
-# Fix 1: stop CachedAppOptimizer FULL (MADV_PAGEOUT) compaction churn
+# Fix 1: stop CachedAppOptimizer app compaction (the swap-refault loop)
+#
+# Verified against this build's /system/framework/services.jar (Android 16;
+# CachedAppOptimizer matches AOSP android16-release):
+#   - use_compaction is the ONLY master switch (DeviceConfig namespace
+#     "activity_manager").
+#   - There is no "disable FULL only" switch: use_full_compaction,
+#     use_recompression, compact_full_oom_adj and compact_throttle_full_full do
+#     not exist - nothing reads them. v1.0.x/v1.1.x wrote two of those; they
+#     were pure no-ops (device_config put accepts any key).
+#   - resolveCompactionProfile() maps SOME -> NONE and FULL -> ANON
+#     (ENABLE_SHARED_AND_CODE_COMPACT=false): the only compaction that ever
+#     runs is anon pageout to zram - exactly the churn this module exists to
+#     stop. There is no harmless compaction left to keep.
 apply_compaction() {
-    [ "$CFG_DISABLE_FULL_COMPACTION" = "1" ] || [ "$CFG_DISABLE_COMPACTION" = "1" ] || return 0
     ensure_sync_disabled
-    if [ "$CFG_DISABLE_COMPACTION" = "1" ]; then
-        # hard mode: no compaction at all
-        dc_put activity_manager use_compaction false
-        dc_put activity_manager use_full_compaction false
-        dc_put activity_manager use_recompression false
-    else
-        # gentle: FULL compaction effectively off for cached apps (adj 900-999),
-        # throttle the remaining FULL events to at most one per 20 s
-        dc_put activity_manager compact_full_oom_adj 999
-        dc_put activity_manager compact_throttle_full_full 20000
-    fi
+    # always drop the dead keys this module used to write (residue cleanup)
+    dc_delete activity_manager compact_full_oom_adj
+    dc_delete activity_manager compact_throttle_full_full
+    dc_delete activity_manager use_full_compaction
+    dc_delete activity_manager use_recompression
+    [ "$CFG_DISABLE_COMPACTION" = "1" ] || return 0
+    dc_put activity_manager use_compaction false
 }
 
 # After a config change lmkd re-reads its properties (lmkd.rc runs
@@ -233,10 +272,49 @@ print_status() {
     echo "  vm.swappiness                       = $(cat /proc/sys/vm/swappiness 2>/dev/null)"
     echo "  ro.lmk.medium                       = $(getprop ro.lmk.medium)"
     echo "  lmkd.reinit                         = $(getprop lmkd.reinit)"
-    echo "  activity_manager/compact_full_oom_adj    = $(device_config get activity_manager compact_full_oom_adj 2>/dev/null)"
-    echo "  activity_manager/compact_throttle_full_full = $(device_config get activity_manager compact_throttle_full_full 2>/dev/null)"
     echo "  activity_manager/use_compaction          = $(device_config get activity_manager use_compaction 2>/dev/null)"
     echo "  lmkd_native/thrashing_limit         = $(device_config get lmkd_native thrashing_limit 2>/dev/null)"
     echo "  lmkd_native/psi_partial_stall_ms    = $(device_config get lmkd_native psi_partial_stall_ms 2>/dev/null)"
     echo "  lmkd_native/psi_complete_stall_ms   = $(device_config get lmkd_native psi_complete_stall_ms 2>/dev/null)"
+}
+
+# ---------------------------------------------------------------- churn ------
+
+# vm_rate <counter> <file1> <file2> <seconds> -> integer pages/s
+vm_rate() {
+    _a=$(grep -m1 "^$1 " "$2" 2>/dev/null | tr -dc '0-9 ')
+    _a=${_a##* }
+    _b=$(grep -m1 "^$1 " "$3" 2>/dev/null | tr -dc '0-9 ')
+    _b=${_b##* }
+    _a=${_a:-0}
+    _b=${_b:-0}
+    echo $(( (_b - _a) / $4 ))
+}
+
+# Churn check: 5s /proc/vmstat delta. The compaction/refault loop shows up as
+# workingset_refault_anon tracking pswpin (everything paged to zram comes right
+# back); a healthy idle device shows ~0 for both.
+print_churn() {
+    _f1="$PERSIST_DIR/.vmstat_a"
+    _f2="$PERSIST_DIR/.vmstat_b"
+    [ -r /proc/vmstat ] || return 0
+    cat /proc/vmstat > "$_f1" 2>/dev/null || return 0
+    sleep 5
+    cat /proc/vmstat > "$_f2" 2>/dev/null || return 0
+    _pin=$(vm_rate pswpin "$_f1" "$_f2" 5)
+    _pout=$(vm_rate pswpout "$_f1" "$_f2" 5)
+    _ws=$(vm_rate workingset_refault_anon "$_f1" "$_f2" 5)
+    _maj=$(vm_rate pgmajfault "$_f1" "$_f2" 5)
+    echo "  churn rate (5s sample):"
+    echo "    pswpout                  = $_pout pages/s (compaction paging out)"
+    echo "    pswpin                   = $_pin pages/s"
+    echo "    workingset_refault_anon  = $_ws pages/s"
+    echo "    pgmajfault               = $_maj pages/s"
+    if [ "$_pin" -le 5 ]; then
+        echo "    -> idle: no swap churn (expected result)"
+    elif [ "$_ws" -ge $(( (_pin * 8) / 10 )) ]; then
+        echo "    -> refault loop ACTIVE: pages paged to zram come straight back"
+    else
+        echo "    -> swap activity present, but not the refault loop"
+    fi
 }
