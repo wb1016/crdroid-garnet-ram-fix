@@ -1,0 +1,6 @@
+id=crdroid-garnet-ram-fix
+name=crDroid garnet RAM Fix
+version=v1.0.0
+versionCode=100
+author=CobaltDev
+description=Fixes background app kills on garnet (ro.lmk.medium=700, CachedAppOptimizer FULL compaction churn, lmkd_native "thrashing" kills, page-cluster/swappiness misconfig)
