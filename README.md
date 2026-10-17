@@ -27,7 +27,7 @@ watchdog, from `/data/adb/crdroid-garnet-ram-fix/`:
 | Kill depth | `ro.lmk.medium` | 700 → 800 (AOSP default) |
 | Thrashing tolerance | `lmkd_native/thrashing_limit` | 100 → 400 |
 | PSI tolerance | `lmkd_native/psi_partial_stall_ms` | → 150 |
-| PSI tolerance | `lmkd_native/psi_complete_stall_ms` | → 1500 |
+| PSI tolerance | `lmkd_native/psi_complete_stall_ms` | → 900 (≤ PSI window) |
 | Stop compaction churn | `activity_manager/compact_full_oom_adj` | 900 → 999 |
 | Throttle compaction | `activity_manager/compact_throttle_full_full` | → 20000 |
 | Cheap zram refaults | `vm.page-cluster` | 3 → 0 |
@@ -79,6 +79,38 @@ If the gentle compaction fix is not enough, set `CFG_DISABLE_COMPACTION=1`, rebo
 manages  the ROM's own `thrashing_limit_critical` override is left alone), re-enables
 DeviceConfig sync and removes `/data/adb/crdroid-garnet-ram-fix`. Runtime `resetprop` and
 sysctl changes vanish at reboot.
+
+## Safety notes (v1.0.0 regression)
+
+v1.0.0 set `lmkd_native/psi_complete_stall_ms=1500`. That value is **invalid**:
+lmkd registers its PSI monitors with a fixed 1000 ms window
+(`PSI_WINDOW_SIZE_MS`), and the kernel rejects a trigger whose stall threshold
+exceeds its window (`psi_trigger_create()`: `threshold_us > window_us` →
+`-EINVAL`). lmkd then cannot come up at all (its vmpressure fallback also fails
+on memcg v2) and exits with *"New configuration is not supported. Exiting..."* —
+on every restart, because the value is persisted in DeviceConfig.
+
+A dead lmkd makes system_server block up to 3 s in
+`LmkdConnection.waitForConnection()` **while holding the AMS lock** on every
+OomAdj update (`ProcessList.writeLmkd`), so the whole framework grinds to a
+halt: SystemUI lag, `Blocked in handler on ActivityManager for 15s` ANRs, and
+`system_server_pre_watchdog` — with CPU and memory pressure near zero.
+
+Since v1.1.0:
+
+- all `psi_*_stall_ms` values are clamped to 1000 ms (`dc_put_bounded`);
+- after every lmkd config change the module checks `init.svc.lmkd`; if lmkd is
+  not `running`, it deletes the `lmkd_native` keys again, re-triggers
+  `lmkd.reinit`, logs the rollback and creates
+  `/data/adb/crdroid-garnet-ram-fix/.lmkd_rollback` so the watchdog stops
+  re-applying the bad config (delete that file to retry);
+- `action.sh` shows the lmkd service state.
+
+To recover a device broken by v1.0.0: the bad value survives module removal
+(it lives in `/data/system/users/0/settings_config.xml`), so delete the
+`lmkd_native/*` DeviceConfig keys (`device_config delete`, or remove the
+`<setting>` entries from `settings_config.xml` while booted in recovery) before
+rebooting.
 
 ## Layout
 

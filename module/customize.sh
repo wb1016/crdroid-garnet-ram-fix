@@ -54,7 +54,8 @@ CFG_DISABLE_COMPACTION=0
 #     ro.lmk.medium 800 (AOSP default; the ROM ships 700 = PREVIOUS_APP_ADJ,
 #     which is why "the app I just left" gets killed when switching)
 #     lmkd_native: thrashing_limit 400, psi_partial_stall_ms 150,
-#     psi_complete_stall_ms 1500 (tolerate zram refaults instead of killing)
+#     psi_complete_stall_ms 900 (tolerate zram refaults instead of killing;
+#     stall values are capped at 1000 = the PSI window lmkd uses)
 CFG_FIX_LMKD=1
 
 # 1 = cheap zram refaults: vm.page-cluster=0 (the vendor script intends this but

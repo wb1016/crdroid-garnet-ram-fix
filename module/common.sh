@@ -118,6 +118,28 @@ dc_put() {
     fi
 }
 
+# dc_put_bounded <namespace> <key> <value> <max> - dc_put with a hard upper bound
+# PSI stall thresholds are validated against the PSI monitoring window
+# (PSI_WINDOW_SIZE_MS = 1000 ms in lmkd): the kernel rejects triggers with
+# threshold > window (psi_trigger_create -> -EINVAL), lmkd then cannot register
+# its pressure monitors and EXITS ("New configuration is not supported. Exiting...").
+# A dead lmkd makes system_server block up to 3 s per OomAdj update in
+# LmkdConnection.waitForConnection while holding the AMS lock -> the entire
+# framework stalls (this is what v1.0.0 did with psi_complete_stall_ms=1500).
+PSI_MAX_STALL_MS=1000
+
+dc_put_bounded() {
+    _ns="$1"
+    _key="$2"
+    _want="$3"
+    _max="$4"
+    if [ "$_want" -gt "$_max" ] 2>/dev/null; then
+        log WARN "$_ns/$_key='$_want' exceeds safe maximum '$_max'; clamping"
+        _want="$_max"
+    fi
+    dc_put "$_ns" "$_key" "$_want"
+}
+
 # ------------------------------------------------------------ the fixes -----
 
 # Stop DeviceConfig from syncing our values away (GMS) - once per install
@@ -149,19 +171,41 @@ apply_compaction() {
     fi
 }
 
+# After a config change lmkd re-reads its properties (lmkd.rc runs
+# "lmkd --reinit" for every persist.device_config.lmkd_native.* change). If it
+# cannot apply them it exits and restarts in a crash loop; system_server then
+# stalls on every OomAdj update. Roll back our keys so the device stays usable
+# and stop re-applying them (marker removed on module uninstall / manual reset).
+verify_lmkd() {
+    sleep 2
+    _state="$(getprop init.svc.lmkd)"
+    [ "$_state" = "running" ] && return 0
+    log ERROR "lmkd is '$_state' after reinit - rolling back lmkd_native keys"
+    for _key in thrashing_limit psi_partial_stall_ms psi_complete_stall_ms; do
+        device_config delete lmkd_native "$_key" >/dev/null 2>&1
+    done
+    setprop lmkd.reinit 1 >/dev/null 2>&1
+    touch "$PERSIST_DIR/.lmkd_rollback" 2>/dev/null
+    log ERROR "lmkd config rolled back; lmkd fixes disabled (remove $PERSIST_DIR/.lmkd_rollback to retry)"
+    return 1
+}
+
 # Fix 2: sane lmkd kill depth + tolerances
 apply_lmkd() {
     [ "$CFG_FIX_LMKD" = "1" ] || return 0
+    [ -f "$PERSIST_DIR/.lmkd_rollback" ] && return 0
     _before=$CHANGED
     ensure_sync_disabled
     # AOSP default; 700 = PREVIOUS_APP_ADJ (the app you just left becomes killable)
     set_ro_prop ro.lmk.medium 800
     # stop "thrashing" kills while GBs of RAM are free (refaults != pressure)
     dc_put lmkd_native thrashing_limit 400
-    dc_put lmkd_native psi_partial_stall_ms 150
-    dc_put lmkd_native psi_complete_stall_ms 1500
+    # tolerate stall instead of killing; both values MUST stay <= PSI_MAX_STALL_MS
+    dc_put_bounded lmkd_native psi_partial_stall_ms 150 "$PSI_MAX_STALL_MS"
+    dc_put_bounded lmkd_native psi_complete_stall_ms 900 "$PSI_MAX_STALL_MS"
     if [ "$CHANGED" -gt "$_before" ]; then
         setprop lmkd.reinit 1 >/dev/null 2>&1 && log INFO "lmkd.reinit triggered"
+        verify_lmkd
     fi
 }
 
@@ -184,6 +228,7 @@ apply_all() {
 # ---------------------------------------------------------------- status -----
 
 print_status() {
+    echo "  lmkd service state                  = $(getprop init.svc.lmkd)"
     echo "  vm.page-cluster                     = $(cat /proc/sys/vm/page-cluster 2>/dev/null)"
     echo "  vm.swappiness                       = $(cat /proc/sys/vm/swappiness 2>/dev/null)"
     echo "  ro.lmk.medium                       = $(getprop ro.lmk.medium)"
